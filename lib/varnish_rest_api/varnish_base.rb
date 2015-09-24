@@ -20,6 +20,7 @@ class VarnishBase
     @varnishadm_path = params.fetch(:varnishadm_path, '/usr/bin/varnishadm')
     @varnishadm = "#{@varnishadm_path.to_s} -T #{@mgmt_host.to_s}:#{@mgmt_port.to_s} -S #{@secret.to_s}"
     @hostname = Socket.gethostname
+    @ipaddress = Socket::getaddrinfo(@hostname,"echo",Socket::AF_INET)[0][3]
 
     puts "varnish_rest_api version #{VarnishRestApiVersion::VERSION}"
     puts "varnishadm command line: " + @varnishadm.to_s
@@ -29,15 +30,21 @@ class VarnishBase
       begin
         @zk = ZK.new(@zookeeper_host)
       rescue RuntimeError => e
-          abort "problem connecting to zookeeper host: #{@zookeeper_host}"
+        abort "problem connecting to zookeeper host: #{@zookeeper_host}"
       end
         
       begin  
-        node = @zookeeper_basenode + '/' + @hostname  
+        service_node = @zookeeper_basenode + '/service'
         # if the node exists, delete it since it is probably not from our zk session  
-        @zk.delete(node,:ignore => [:no_node,:not_empty,:bad_version])  
         @zk.create(@zookeeper_basenode, :mode => :persistent, :ignore => [:no_node,:node_exists])
-        @zk.create(node,"#{@hostname}:#{@port}", :mode => :ephemeral_sequential, :ignore => [:no_node,:not_empty,:bad_version])
+        @zk.create(service_node, :mode => :persistent, :ignore => [:no_node,:node_exists])
+        # create entries for all backends
+        list_backends().each {|b|
+          backend_node = service_node + '/' + b.uuid
+          varnish_node = backend_node + '/' + @hostname
+          @zk.create(backend_node, :mode => :persistent, :ignore => [:no_node,:node_exists])
+          @zk.create(varnish_node,"http://#{@ipaddress}:10001/#{b.backend_name}", :mode => :ephemeral, :ignore => [:no_node,:node_exists,:not_empty,:bad_version])
+        }
       rescue ZK::Exceptions::NoNode => zke
         $stderr.puts "something went wrong creating the zookeeper node #{node}: " + zke.message
       end
@@ -73,7 +80,7 @@ class VarnishBase
   end
   
   # backend enable/disable
-   def set_health(backend,health,options={})
+  def set_health(backend,health,options={})
     default_options = {
      :safe => true,
      :json => false
@@ -91,8 +98,15 @@ class VarnishBase
       error = { 'error' => "multiple backends found for pattern '#{backend}': " +  backends_found.collect { |b| b.backend_name }.join(',')}
       return  options[:json] ? JSON.pretty_generate(error) : error
     end
-    
-    varnishadm("backend.set_health #{backend} #{health}")    
+
+    # backend referenced with uuid, get backend title from result
+    if backend =~ /[a-fA-F0-9]{40}/
+      backend_str = backends_found[0]['backend_name']
+    else
+      backend_str = backend
+    end
+
+    varnishadm("backend.set_health #{backend_str} #{health}")
     list_backends(:expression => backend, :json => options[:json])
   end
    
@@ -110,7 +124,7 @@ class VarnishBase
       command += " #{options[:expression]}"
     end
     
-    varnishadm_result = varnishadm(command)
+    varnishadm_result = filter_backends(command)
     #puts "command => " + command
     
     unless varnishadm_result[:error].empty?
@@ -131,11 +145,38 @@ class VarnishBase
       backend.refs = match[3].to_s
       backend.admin = match[4].to_s
       backend.health = match[5].to_s
+      backend.uuid = Digest::SHA1.hexdigest "#{backend.host}".gsub(/(,){1,}/,":")
+      backend.uuid_str = "#{backend.host}".gsub(/(,){1,}/,":")
       backends << backend
     end
     options[:json] ? JSON.pretty_generate(backends.map { |o| Hash[o.each_pair.to_a] }) : backends
   end
-  
+
+  # wrapper function to also support uuids for services
+  def filter_backends(command=command)
+    unless command =~ / [a-fA-F0-9]{40}$/
+      varnishadm(command)
+    else
+      output = Array.new
+      error = Array.new
+      filter_uuid = / ([a-fA-F0-9]{40})$/.match(command)[1]
+      varnishadm_result = varnishadm("backend.list")
+      unless varnishadm_result[:error].empty?
+        return options[:json] ? JSON.pretty_generate(varnishadm_result[:error]) : varnishadm_result[:error]
+      end
+      varnishadm_result[:output].to_a.each_with_index {|line,i|
+        output << line if i < 1
+        match = /\((.*)\) /.match(line)
+	if match
+          host_port = match[1].gsub(/(,){1,}/,':')
+          backend_uuid = Digest::SHA1.hexdigest "#{host_port}"
+          output << line if backend_uuid == filter_uuid
+        end
+      }
+      return { :output => output , :error => error}
+    end
+  end
+
   # Display the varnish banner
   def banner
     JSON.pretty_generate({ 'banner' => output(varnishadm("banner"))})
